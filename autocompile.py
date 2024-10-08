@@ -19,13 +19,13 @@ def get_module_name(model: Any, target_module: nn.Module) -> str | None:
     if model is target_module:
         return ""
     if hasattr(model, "__dict__"):
-        for name, attr in model.__dict__.items():
+        for name in dir(model):
+            attr = getattr(model, name, None)
             if attr is target_module:
                 return name
-            if isinstance(attr, nn.Module) or hasattr(attr, "__dict__"):
-                child_name = get_module_name(attr, target_module)
-                if child_name is not None:
-                    return f"{name}.{child_name}"
+            child_name = get_module_name(attr, target_module)
+            if child_name is not None:
+                return f"{name}.{child_name}"
     return None
 
 
@@ -53,6 +53,7 @@ class ModuleCompiler:
     def __init__(self, model: Any):
         self.model = model
         self.module_calls: list[tuple[nn.Module, list[torch.Size]]] = []
+        self.frames_to_watch: set[int] = set()
         self.frames_to_ignore: set[int] = set()
 
     def trace_calls(self, frame: FrameType, event: str, arg: Any) -> Any | None:
@@ -69,9 +70,10 @@ class ModuleCompiler:
             return
 
         # Check if we should ignore this frame
-        if frame.f_back and id(frame.f_back) in self.frames_to_ignore:
-            self.frames_to_ignore.add(id(frame))
-            return
+        if id(frame) not in self.frames_to_watch:
+            if id(frame.f_back) in (self.frames_to_ignore | self.frames_to_watch):
+                self.frames_to_ignore.add(id(frame))
+                return
 
         locals_ = frame.f_locals
 
@@ -90,8 +92,7 @@ class ModuleCompiler:
                 # Record the module and input shapes
                 shapes = [v.shape for v in args]
                 self.module_calls.append((self_obj, shapes))
-            # Now that we've decided to compile (or not) this frame, ignore it
-            self.frames_to_ignore.add(id(frame))
+                self.frames_to_watch.add(id(frame))
 
     @contextlib.contextmanager
     def enable_tracing(self) -> Iterator[None]:
@@ -121,7 +122,9 @@ class ModuleCompiler:
         for module, shapes in self.module_calls:
             module_name = get_module_name(self.model, module)
             if module_name is not None:
-                module_dict.setdefault(module_name, (module, []))[1].append(shapes)
+                if module_name not in module_dict:
+                    module_dict[module_name] = (module, [])
+                module_dict[module_name][1].append(shapes)
 
         # Remove submodules
         modules_to_compile: dict[str, list[Input]] = {}
@@ -131,7 +134,7 @@ class ModuleCompiler:
                 for other_name, (other_module, _) in module_dict.items()
                 if other_name != module_name
             ):
-                continue
+                print("warning: is submodule")
 
             # Transpose shape_lists to get shapes per input
             shapes_per_input = list(zip(*shape_lists))
@@ -174,5 +177,3 @@ class ModuleCompiler:
             # Replace the module in the model
             set_module_by_name(self.model, module_name, compiled_module)
             print(f"Replaced module '{module_name}' with its compiled version.\n")
-
-

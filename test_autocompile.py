@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from autocompile import ModuleCompiler
 
+
 def test_static_shape():
     class StaticModel(nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,9 +122,39 @@ def test_complex_pipeline():
     print("Complex pipeline test passed.")
 
 
+def test_clip():
+    import transformers
+
+    class Embedder:
+        def __init__(self):
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                "openai/clip-vit-base-patch32"
+            )
+            self.clip_model = (
+                transformers.CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+                .eval()
+                .cuda()
+            )
+
+        def embed(self, texts: list[str]) -> torch.Tensor:
+            inputs = self.tokenizer(texts, return_tensors="pt", padding=True).to("cuda")
+            return self.clip_model.get_text_features(**inputs)
+
+    embedder = Embedder()
+    compiler = ModuleCompiler(embedder)
+    for i in range(1, 2):
+        compiler.run_model(embedder.embed, ["a dog"] * i)
+    print(compiler.module_calls)
+    modules_to_compile = compiler.determine_modules_to_compile()
+    assert modules_to_compile
+    print("modules to compile for clip:", modules_to_compile)
+
+    compiler.compile_and_replace_modules(modules_to_compile)
+
+
 if __name__ == "__main__":
     # Run tests manually
-    test_static_shape()
-    test_dynamic_shape()
+    test_clip()
+    # test_static_shape()
+    # test_dynamic_shape()
     test_complex_pipeline()
-
