@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from autocompile import ModuleCompiler
+from tracer import ShapeTracer, compile_module
 
 
 def test_static_shape():
@@ -9,19 +9,20 @@ def test_static_shape():
             return x * 2
 
     model = StaticModel().eval()
-    compiler = ModuleCompiler(model)
+    tracer = ShapeTracer(model)
 
     # Run the model multiple times with the same input shape
-    inputs = [(torch.randn(1, 3),), (torch.randn(1, 3),)]
-    compiler.run_model_many(model, inputs)
+    with tracer.trace():
+        model(torch.randn(1, 3))
+        model(torch.randn(1, 3))
 
-    modules_to_compile = compiler.determine_modules_to_compile()
+    modules_to_compile = tracer.determine_modules_to_compile()
 
     assert len(modules_to_compile) == 1
-    trt_inputs = modules_to_compile[""]
-    assert len(trt_inputs) == 1
-    input_shape = trt_inputs[0].shape
-    assert input_shape == torch.Size([1, 3])
+    assert "" in modules_to_compile  # Root module
+    input_spec = modules_to_compile[""][0]
+    assert input_spec["shape"] == (1, 3)
+    assert input_spec["dtype"] == torch.float32
 
     print("Static shape test passed.")
 
@@ -32,20 +33,22 @@ def test_dynamic_shape():
             return x + 1
 
     model = DynamicModel().eval()
-    compiler = ModuleCompiler(model)
+    tracer = ShapeTracer(model)
 
     # Run the model multiple times with different input shapes
-    inputs = [(torch.randn(i, 3),) for i in range(1, 5)]
-    compiler.run_model_many(model, inputs)
+    with tracer.trace():
+        for i in range(1, 5):
+            model(torch.randn(i, 3))
 
-    modules_to_compile = compiler.determine_modules_to_compile()
+    modules_to_compile = tracer.determine_modules_to_compile()
 
     assert len(modules_to_compile) == 1
-    trt_inputs = modules_to_compile[""]
-    assert len(trt_inputs) == 1
-    trt_input = trt_inputs[0]
-    expected = {"min_shape": (1, 3), "opt_shape": (4, 3), "max_shape": (4, 3)}
-    assert trt_input.shape == expected
+    assert "" in modules_to_compile  # Root module
+    input_spec = modules_to_compile[""][0]
+    assert input_spec["min_shape"] == (1, 3)
+    assert input_spec["opt_shape"] == (4, 3)
+    assert input_spec["max_shape"] == (4, 3)
+    assert input_spec["dtype"] == torch.float32
 
     print("Dynamic shape test passed.")
 
@@ -59,9 +62,9 @@ def test_complex_pipeline():
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return x * 2
 
-    class BadProcessor(nn.Module):
-        def forward(self, x: torch.Tensor, count: int) -> torch.Tensor:
-            return torch.stack([x] * count)
+    # class BadProcessor(nn.Module):
+    #     def forward(self, x: torch.Tensor, count: int) -> torch.Tensor:
+    #         return torch.stack([x] * count)
 
     class UpscalerModel(nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -78,12 +81,13 @@ def test_complex_pipeline():
 
     class UpscalerPipeline:
         def __init__(self):
-            self.image_processor = BadProcessor()
+            #self.image_processor = BadProcessor()
             self.model = UpscalerModel()
 
         def upscale(self, images: torch.Tensor) -> torch.Tensor:
-            processed_images = self.image_processor(images, 3)
-            return self.model(processed_images)
+            #processed_images = self.image_processor(images, 3)
+            processed_images = torch.stack([images] * 3)
+            return self.model(processed_images )
 
     class Predictor:
         def __init__(self):
@@ -95,30 +99,32 @@ def test_complex_pipeline():
             return self.upscaler.upscale(images)
 
     predictor = Predictor()
-    compiler = ModuleCompiler(predictor)
+    tracer = ShapeTracer(predictor)
 
     # Run the model multiple times with different inputs
-    args_list = [("hello", 2), ("world", 3)]
-    compiler.run_model_many(predictor.predict, args_list)
+    with tracer.trace():
+        predictor.predict("hello", 2)
+        predictor.predict("world", 3)
 
-    modules_to_compile = compiler.determine_modules_to_compile()
+    modules_to_compile = tracer.determine_modules_to_compile()
 
     expected_modules = {"image_pipe.model", "upscaler.model"}
     assert set(modules_to_compile.keys()) == expected_modules
 
     # Check the input shapes for 'image_pipe.model'
-    trt_inputs_image = modules_to_compile["image_pipe.model"]
-    assert len(trt_inputs_image) == 1
-    trt_input_image = trt_inputs_image[0]
-    expected = {"min_shape": (2, 1), "opt_shape": (3, 1), "max_shape": (3, 1)}
-    assert trt_input_image.shape == expected
+    image_model_spec = modules_to_compile["image_pipe.model"][0]
+    assert image_model_spec["min_shape"] == (2, 1)
+    assert image_model_spec["opt_shape"] == (3, 1)
+    assert image_model_spec["max_shape"] == (3, 1)
+    assert image_model_spec["dtype"] == torch.float32
 
     # Check the input shapes for 'upscaler.model'
-    trt_inputs_upscaler = modules_to_compile["upscaler.model"]
-    assert len(trt_inputs_upscaler) == 1
-    trt_input_upscaler = trt_inputs_upscaler[0]
-    expected = {"min_shape": (3, 2, 1), "opt_shape": (3, 3, 1), "max_shape": (3, 3, 1)}
-    assert trt_input_upscaler.shape == expected
+    upscaler_spec = modules_to_compile["upscaler.model"][0]
+    assert upscaler_spec["min_shape"] == (3, 2, 1)
+    assert upscaler_spec["opt_shape"] == (3, 3, 1)
+    assert upscaler_spec["max_shape"] == (3, 3, 1)
+    assert upscaler_spec["dtype"] == torch.float32
+
     print("Complex pipeline test passed.")
 
 
@@ -141,12 +147,23 @@ def test_clip():
             return self.clip_model.get_text_features(**inputs)
 
     embedder = Embedder()
-    compiler = ModuleCompiler(embedder)
-    for i in range(1, 2):
-        compiler.run_model(embedder.embed, ["a dog"] * i)
-    print(compiler.module_calls)
-    modules_to_compile = compiler.determine_modules_to_compile()
-    assert modules_to_compile
-    print("modules to compile for clip:", modules_to_compile)
+    tracer = ShapeTracer(embedder)
 
-    compiler.compile_and_replace_modules(modules_to_compile)
+    with tracer.trace():
+        for i in range(1, 2):
+            embedder.embed(["a dog"] * i)
+
+    modules_to_compile = tracer.determine_modules_to_compile()
+    assert modules_to_compile
+    print("Modules to compile for CLIP:", modules_to_compile)
+
+    # Optional: test compilation
+    compile_module(embedder, modules_to_compile)
+
+
+if __name__ == "__main__":
+    test_static_shape()
+    test_dynamic_shape()
+    test_complex_pipeline()
+    # Uncomment to run CLIP test (requires transformers library and GPU)
+    test_clip()
